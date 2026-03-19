@@ -287,6 +287,7 @@ class Notifier:
 
     async def notify_window_summary(
         self,
+        new_window_slug: str,
         window_slug: str,
         open_price: float,
         close_price: float,
@@ -295,82 +296,102 @@ class Notifier:
         current_btc_price: float,
         stats: dict,
         dry_run: bool,
+        sniper_peak_move_pct: float = 0.0,
+        sniper_peak_move_second: int = 0,
     ) -> None:
         """
         Envía el resumen de la ventana de 5 minutos que acaba de cerrar.
-        Se llama al inicio de cada nueva ventana.
+        Se llama al inicio de cada nueva ventana, sin excepción.
 
         Args:
+            new_window_slug: Slug de la nueva ventana que acaba de comenzar
             window_slug: Slug de la ventana que cerró (ej: btc-updown-5m-1710000000)
-            open_price: Precio BTC de apertura de esa ventana
-            close_price: Precio BTC de cierre de esa ventana
-            trade: Trade colocado en esa ventana, o None si no hubo
+            open_price: Precio BTC de apertura de la ventana anterior
+            close_price: Precio BTC de cierre de la ventana anterior
+            trade: Trade colocado en la ventana anterior, o None si no hubo
             skip_reason: Razón por la que no se operó (si trade is None)
             current_btc_price: Precio actual de BTC (inicio de nueva ventana)
             stats: Diccionario de estadísticas del RiskManager
             dry_run: True si el bot está en modo simulación
+            sniper_peak_move_pct: Mayor movimiento % detectado por el sniper en la ventana
+            sniper_peak_move_second: Segundo de la ventana donde se detectó el pico
         """
-        # Movimiento real de BTC en la ventana anterior
-        actual_went_up = close_price > open_price
-        actual_emoji = "⬆️" if actual_went_up else "⬇️"
-        actual_dir = "UP" if actual_went_up else "DOWN"
+        # --- Header: nueva ventana ---
+        new_slug_escaped = _escape_mdv2(new_window_slug)
 
-        # Slug con guiones escapados para MarkdownV2
-        slug_escaped = _escape_mdv2(window_slug)
+        # --- Sección: ventana anterior ---
+        move_pct = (close_price - open_price) / open_price * 100 if open_price > 0 else 0.0
+        went_up = move_pct >= 0
+        move_emoji = "⬆️" if went_up else "⬇️"
+        move_dir = "SUBIÓ" if went_up else "BAJÓ"
+        move_sign = "\\+" if went_up else ""
         open_str = _escape_mdv2(f"${open_price:,.2f}")
         close_str = _escape_mdv2(f"${close_price:,.2f}")
+        move_str = _escape_mdv2(f"{abs(move_pct):.3f}%")
+
+        # --- Sección: sniper ---
+        peak_abs = abs(sniper_peak_move_pct)
+        peak_sign = "\\+" if sniper_peak_move_pct >= 0 else "\\-"
+        peak_str = _escape_mdv2(f"{peak_abs:.3f}%")
+        threshold_str = _escape_mdv2(f"{self.config.sniper_threshold:.2f}%")
+        peak_second_str = _escape_mdv2(str(sniper_peak_move_second))
 
         lines: list[str] = [
-            "📊 *Resumen ventana anterior*",
-            f"⏱ Ventana: `{slug_escaped}`",
-            f"📈 BTC apertura: `{open_str}` → cierre: `{close_str}`",
-            f"📉 Resultado real: {actual_emoji} {actual_dir}",
+            f"🕐 *Nueva ventana — {new_slug_escaped}*",
+            f"📊 *Ventana anterior*",
+            f"📈 BTC apertura: {open_str}",
+            f"📉 BTC cierre: {close_str}",
+            f"➡️ Movimiento: {move_sign}{move_str} {move_emoji} {move_dir}",
+            f"🎯 *Sniper*",
+            f"Mayor movimiento detectado: {peak_sign}{peak_str} a los {peak_second_str}s",
+            f"Umbral configurado: {threshold_str}",
+            f"🤖 *Bot*",
         ]
 
         if trade is not None and trade.resolved:
+            price_str = _escape_mdv2(f"${trade.token_price:.2f}")
+            lines.append(f"Apostó: ✅ {trade.direction} @ {price_str}")
+
             result_emoji = "✅" if trade.won else "❌"
             win_str = "GANÓ" if trade.won else "PERDIÓ"
-            pnl_sign = "\\+" if trade.pnl_usdc >= 0 else ""
-            pnl_val = _escape_mdv2(f"${abs(trade.pnl_usdc):.2f}")
-            pnl_display = f"{pnl_sign}{pnl_val}"
-            price_str = _escape_mdv2(f"${trade.token_price:.2f}")
-
-            lines.append(
-                f"\n🤖 *Bot apostó:* {trade.direction} @ `{price_str}`"
-            )
+            pnl_abs = abs(trade.pnl_usdc)
+            pnl_sign = "\\+" if trade.pnl_usdc >= 0 else "\\-"
+            pnl_str = _escape_mdv2(f"${pnl_abs:.2f}")
 
             if dry_run:
                 lines.append(
                     f"🧪 \\[SIM\\] Resultado: {result_emoji} {win_str} "
-                    f"\\({pnl_display}\\)"
+                    f"\\({pnl_sign}{pnl_str}\\)"
                 )
             else:
                 lines.append(
                     f"💰 \\[REAL\\] Resultado: {result_emoji} {win_str} "
-                    f"\\({pnl_display}\\)"
+                    f"\\({pnl_sign}{pnl_str}\\)"
                 )
         else:
-            # No se apostó en esta ventana
-            reason = skip_reason or "Sin señal en esta ventana"
+            reason = skip_reason or "sin movimiento"
             reason_escaped = _escape_mdv2(reason)
-            lines.append(f"\n⏭️ No apostó esta ventana \\({reason_escaped}\\)")
+            lines.append(f"⏭️ No apostó \\(motivo: {reason_escaped}\\)")
 
-        # Estado actual
+        # --- Sección: resumen del día ---
         wins = stats.get("wins", 0)
         losses = stats.get("losses", 0)
         win_rate = stats.get("win_rate", 0.0)
         daily_pnl = stats.get("daily_pnl_usdc", 0.0)
+        total_trades = stats.get("resolved", 0)
 
-        pnl_sign = "\\+" if daily_pnl >= 0 else "\\-"
-        pnl_abs = _escape_mdv2(f"${abs(daily_pnl):.2f}")
-        winrate_pct = _escape_mdv2(f"{win_rate:.0%}")
+        win_rate_pct = int(win_rate * 100)
+        daily_sign = "\\+" if daily_pnl >= 0 else "\\-"
+        daily_abs_str = _escape_mdv2(f"${abs(daily_pnl):.2f}")
         btc_now_str = _escape_mdv2(f"${current_btc_price:,.2f}")
+        total_str = _escape_mdv2(str(total_trades))
 
         lines.extend([
-            "\n📊 *Estado actual*",
-            f"💵 BTC ahora: `{btc_now_str}`",
-            f"📅 P&L hoy: `{pnl_sign}{pnl_abs}`",
-            f"🏆 Winrate: `{winrate_pct}` \\({wins}W / {losses}L\\)",
+            f"📉 *Resumen del día*",
+            f"💵 BTC ahora: {btc_now_str}",
+            f"📅 P&L hoy: {daily_sign}{daily_abs_str}",
+            f"🏆 Winrate: {win_rate_pct}% \\({wins}W / {losses}L\\)",
+            f"🔢 Trades hoy: {total_str}",
         ])
 
         message = "\n".join(lines)

@@ -15,7 +15,6 @@ from .notifier import Notifier
 from .polymarket_client import PolymarketClient
 from .price_feed import PriceFeed
 from .risk_manager import RiskManager, Trade
-from .strategy import Strategy
 
 logger = get_logger("bot")
 
@@ -31,15 +30,15 @@ class TradingBot:
     """
     Bot de trading principal para mercados BTC Up/Down de 5 minutos de Polymarket.
 
+    Opera EXCLUSIVAMENTE en modo Latency Sniper.
+
     Flujo por ventana de 5 minutos:
     1. Detectar nueva ventana via aritmética de timestamps
     2. Registrar precio de apertura de la ventana
     3. Cada segundo: verificar si el Latency Sniper detecta un movimiento brusco
-    4. En T-ENTRY_SECONDS antes del cierre: analizar señal direccional (si no operó sniper)
-    5. Si señal válida y reglas de riesgo pasan: colocar orden
-    6. Al cerrar la ventana: resolver trade y actualizar PnL
-    7. Enviar resumen de ventana por Telegram al inicio de la nueva ventana
-    8. Notificar resultado por Telegram
+    4. Si sniper dispara señal y reglas de riesgo pasan: colocar orden
+    5. Al cerrar la ventana: resolver trade y actualizar PnL
+    6. Enviar resumen de ventana por Telegram al inicio de la nueva ventana
     """
 
     def __init__(self, config: Config) -> None:
@@ -47,7 +46,6 @@ class TradingBot:
 
         # Componentes del bot
         self.feed = PriceFeed(config.binance_ws_url)
-        self.strategy = Strategy(self.feed)
         self.sniper = LatencySniper(self.feed, config)
         self.polymarket = PolymarketClient(config)
         self.risk_manager = RiskManager(config)
@@ -58,10 +56,13 @@ class TradingBot:
         self._current_window_slug: str = ""
         self._window_open_price: float = 0.0
         self._traded_this_window: bool = False
-        self._last_entry_attempt: int = 0
 
         # Razón por la que no se operó esta ventana (para el resumen)
         self._window_skip_reason: str = ""
+
+        # Seguimiento del mayor movimiento detectado por el sniper en la ventana actual
+        self._sniper_peak_move_pct: float = 0.0
+        self._sniper_peak_move_second: int = 0
 
         # Control del bot
         self._running: bool = False
@@ -166,8 +167,9 @@ class TradingBot:
         self._current_window_ts = self._get_window_timestamp()
         self._current_window_slug = f"btc-updown-5m-{self._current_window_ts}"
         self._traded_this_window = False
-        self._last_entry_attempt = 0
         self._window_skip_reason = ""
+        self._sniper_peak_move_pct = 0.0
+        self._sniper_peak_move_second = 0
         self.sniper.reset_window()
 
         if self.feed.last_price > 0:
@@ -196,6 +198,17 @@ class TradingBot:
         # --- Actualizar sniper con precio actual cada segundo ---
         self.sniper.update()
 
+        # --- Rastrear el mayor movimiento del sniper en la ventana ---
+        price_history = self.sniper._price_history
+        if len(price_history) >= 10:
+            oldest = price_history[0]
+            current = price_history[-1]
+            if oldest > 0:
+                move_pct = (current - oldest) / oldest * 100
+                if abs(move_pct) > abs(self._sniper_peak_move_pct):
+                    self._sniper_peak_move_pct = move_pct
+                    self._sniper_peak_move_second = seconds_in_window
+
         # --- Verificar señal del Latency Sniper ---
         # El sniper puede actuar en cualquier momento cuando quedan > MIN segundos
         if not self._traded_this_window and self.feed.last_price > 0:
@@ -210,20 +223,6 @@ class TradingBot:
                     trade_type="SNIPER", forced_signal=sniper_signal
                 )
                 return
-
-        # --- Verificar si hay que intentar entrada direccional ---
-        entry_window_start = 300 - self.config.entry_seconds_before
-        is_entry_time = seconds_in_window >= entry_window_start
-        already_attempted = self._last_entry_attempt == current_window_ts
-
-        if (
-            is_entry_time
-            and not self._traded_this_window
-            and not already_attempted
-            and self.feed.last_price > 0
-        ):
-            self._last_entry_attempt = current_window_ts
-            await self._try_enter_trade(trade_type="DIRECTIONAL")
 
         # Log periódico del estado (cada 30 segundos)
         if seconds_in_window % 30 == 0 and seconds_in_window > 0:
@@ -245,6 +244,9 @@ class TradingBot:
         prev_close = self.feed.last_price  # Precio al cierre = precio al inicio de la nueva
         prev_traded = self._traded_this_window
         prev_skip_reason = self._window_skip_reason
+        prev_sniper_peak_move_pct = self._sniper_peak_move_pct
+        prev_sniper_peak_move_second = self._sniper_peak_move_second
+        new_window_slug = f"btc-updown-5m-{new_window_ts}"
 
         # Resolver trades pendientes de la ventana anterior
         resolved_trade: Optional[Trade] = None
@@ -255,6 +257,7 @@ class TradingBot:
         if prev_slug and prev_open > 0:
             stats = self.risk_manager.get_stats()
             await self.notifier.notify_window_summary(
+                new_window_slug=new_window_slug,
                 window_slug=prev_slug,
                 open_price=prev_open,
                 close_price=prev_close,
@@ -263,14 +266,17 @@ class TradingBot:
                 current_btc_price=self.feed.last_price,
                 stats=stats,
                 dry_run=self.config.dry_run,
+                sniper_peak_move_pct=prev_sniper_peak_move_pct,
+                sniper_peak_move_second=prev_sniper_peak_move_second,
             )
 
         # Inicializar nueva ventana
         self._current_window_ts = new_window_ts
-        self._current_window_slug = f"btc-updown-5m-{new_window_ts}"
+        self._current_window_slug = new_window_slug
         self._traded_this_window = False
-        self._last_entry_attempt = 0
         self._window_skip_reason = ""
+        self._sniper_peak_move_pct = 0.0
+        self._sniper_peak_move_second = 0
         self.sniper.reset_window()
 
         # Precio de apertura de la nueva ventana
@@ -291,25 +297,27 @@ class TradingBot:
 
     async def _try_enter_trade(
         self,
-        trade_type: str = "DIRECTIONAL",
+        trade_type: str = "SNIPER",
         forced_signal=None,
     ) -> None:
         """
         Intenta entrar en un trade para la ventana actual.
 
         Args:
-            trade_type: "DIRECTIONAL" o "SNIPER"
-            forced_signal: Signal pre-generada por el sniper (si aplica).
-                           Si es None, se genera una señal con la estrategia técnica.
+            trade_type: Tipo de trade (siempre "SNIPER" en este modo)
+            forced_signal: Signal generada por el sniper.
 
         Flujo:
-        1. Genera señal (estrategia técnica o sniper)
+        1. Usa señal del sniper
         2. Verifica reglas de riesgo
         3. Obtiene mercado de Polymarket
         4. Coloca la orden
         5. Registra el trade
         6. Notifica entrada
         """
+        if forced_signal is None:
+            return
+
         seconds_until_close = self._seconds_until_close()
         logger.info(
             f"[{trade_type}] Analizando señal para {self._current_window_slug} | "
@@ -317,11 +325,8 @@ class TradingBot:
             f"BTC: ${self.feed.last_price:,.2f}"
         )
 
-        # 1. Generar señal
-        if forced_signal is not None:
-            signal = forced_signal
-        else:
-            signal = self.strategy.analyze()
+        # 1. Usar señal del sniper
+        signal = forced_signal
 
         logger.info(f"[{trade_type}] Señal generada: {signal}")
 

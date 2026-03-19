@@ -31,6 +31,8 @@ class Trade:
     confidence: float                 # Confianza de la señal
     simulated: bool                   # Si fue simulado
 
+    trade_type: str = "DIRECTIONAL"   # Tipo de trade: DIRECTIONAL o SNIPER
+
     # Campos de resolución (se llenan después)
     resolved: bool = False            # Si el trade fue resuelto
     resolution_time: float = 0.0     # Timestamp de resolución
@@ -202,6 +204,7 @@ class RiskManager:
         tokens_bought: float,
         confidence: float,
         simulated: bool,
+        trade_type: str = "DIRECTIONAL",
     ) -> Trade:
         """
         Registra un nuevo trade en el historial.
@@ -224,11 +227,12 @@ class RiskManager:
             entry_time=time.time(),
             confidence=confidence,
             simulated=simulated,
+            trade_type=trade_type,
         )
 
         self._trades.append(trade)
         logger.info(
-            f"Trade registrado [{trade_id}]: {direction} ${amount_usdc:.2f} USDC "
+            f"Trade registrado [{trade_id}] [{trade_type}]: {direction} ${amount_usdc:.2f} USDC "
             f"@ {token_price:.4f} | confianza={confidence:.1%}"
         )
         return trade

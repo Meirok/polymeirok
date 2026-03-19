@@ -52,7 +52,7 @@ class Config:
 
     # --- Parámetros de trading ---
     bet_amount_usdc: float = field(
-        default_factory=lambda: _get_float("BET_AMOUNT_USDC", 5.0)
+        default_factory=lambda: _get_float("BET_AMOUNT_USDC", 1.0)
     )
     min_confidence: float = field(
         default_factory=lambda: _get_float("MIN_CONFIDENCE", 0.65)
@@ -68,12 +68,12 @@ class Config:
         default_factory=lambda: _get_int("MAX_TRADES_PER_HOUR", 12)
     )
     stop_loss_daily_usd: float = field(
-        default_factory=lambda: _get_float("STOP_LOSS_DAILY_USD", 20.0)
+        default_factory=lambda: _get_float("STOP_LOSS_DAILY_USD", 5.0)
     )
 
     # --- Latency Sniper ---
     sniper_threshold: float = field(
-        default_factory=lambda: _get_float("SNIPER_THRESHOLD", 0.08)
+        default_factory=lambda: _get_float("SNIPER_THRESHOLD", 0.05)
     )
     sniper_min_seconds_left: int = field(
         default_factory=lambda: _get_int("SNIPER_MIN_SECONDS_LEFT", 60)

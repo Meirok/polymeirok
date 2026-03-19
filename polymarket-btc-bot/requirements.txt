@@ -1,0 +1,22 @@
+# Dependencias del bot de trading Polymarket BTC Up/Down 5m
+
+# Cliente de Polymarket CLOB para órdenes en producción
+py-clob-client==0.34.5
+
+# Variables de entorno desde archivo .env
+python-dotenv>=1.0.0
+
+# Peticiones HTTP síncronas (usado internamente por py-clob-client)
+requests>=2.31.0
+
+# WebSocket asíncrono para el feed de Binance
+websockets>=12.0
+
+# Cliente HTTP asíncrono para llamadas a APIs de Polymarket
+aiohttp>=3.9.0
+
+# Cálculos numéricos para indicadores técnicos
+numpy>=1.24.0
+
+# Salida de terminal con colores
+colorama>=0.4.6

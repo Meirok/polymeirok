@@ -1,0 +1,40 @@
+# Credenciales y configuración local (NUNCA subir a Git)
+.env
+
+# Caché de Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# Archivos de distribución y egg
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Entorno virtual
+.venv/
+venv/
+env/
+ENV/
+
+# Logs del bot
+logs/
+*.log
+
+# Archivos de IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Archivos de cobertura de tests
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Archivos temporales
+*.tmp
+*.bak

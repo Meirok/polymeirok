@@ -19,6 +19,15 @@ logger = get_logger("notifier")
 TELEGRAM_API_BASE = "https://api.telegram.org/bot{token}/sendMessage"
 
 
+def _escape_mdv2(text: str) -> str:
+    """
+    Escapa caracteres especiales para Telegram MarkdownV2.
+    Debe aplicarse a todo texto dinámico que no sea parte de la sintaxis de formato.
+    """
+    special = r'\_*[]()~`>#+-=|{}.!'
+    return "".join(f"\\{c}" if c in special else c for c in str(text))
+
+
 class Notifier:
     """
     Notificador via Telegram Bot API.
@@ -106,6 +115,7 @@ class Notifier:
         """
         mode_label = "🔵 SIMULACIÓN" if trade.simulated else "🟢 REAL"
         direction_emoji = "📈" if trade.direction == "UP" else "📉"
+        type_label = "🎯 SNIPER" if trade.trade_type == "SNIPER" else "📊 DIRECTIONAL"
 
         # Formatear breakdown de indicadores
         breakdown_lines = "\n".join(
@@ -114,7 +124,7 @@ class Notifier:
         )
 
         message = (
-            f"*{direction_emoji} TRADE ENTRADA* — {mode_label}\n"
+            f"*{direction_emoji} TRADE ENTRADA* — {mode_label} | {type_label}\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"*ID:* `{trade.trade_id}`\n"
             f"*Mercado:* `{trade.window_slug}`\n"
@@ -233,6 +243,138 @@ class Notifier:
         )
 
         await self._send(message)
+
+    async def _send_mdv2(self, message: str) -> bool:
+        """
+        Envía un mensaje con formato MarkdownV2 por Telegram.
+
+        Args:
+            message: Texto del mensaje en formato MarkdownV2
+
+        Returns:
+            True si se envió correctamente, False en caso contrario
+        """
+        if not self._enabled:
+            return True  # No-op silencioso
+
+        try:
+            url = TELEGRAM_API_BASE.format(token=self.config.telegram_bot_token)
+            payload = {
+                "chat_id": self.config.telegram_chat_id,
+                "text": message,
+                "parse_mode": "MarkdownV2",
+                "disable_web_page_preview": True,
+            }
+
+            session = await self._get_session()
+            async with session.post(url, json=payload) as response:
+                if response.status == 200:
+                    logger.debug("Notificación MarkdownV2 Telegram enviada exitosamente")
+                    return True
+                else:
+                    resp_text = await response.text()
+                    logger.warning(
+                        f"Error Telegram API (MDV2): {response.status} | {resp_text[:200]}"
+                    )
+                    return False
+
+        except aiohttp.ClientError as e:
+            logger.error(f"Error de red al enviar Telegram MDV2: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Error inesperado al enviar Telegram MDV2: {e}", exc_info=True)
+            return False
+
+    async def notify_window_summary(
+        self,
+        window_slug: str,
+        open_price: float,
+        close_price: float,
+        trade: Optional[Trade],
+        skip_reason: str,
+        current_btc_price: float,
+        stats: dict,
+        dry_run: bool,
+    ) -> None:
+        """
+        Envía el resumen de la ventana de 5 minutos que acaba de cerrar.
+        Se llama al inicio de cada nueva ventana.
+
+        Args:
+            window_slug: Slug de la ventana que cerró (ej: btc-updown-5m-1710000000)
+            open_price: Precio BTC de apertura de esa ventana
+            close_price: Precio BTC de cierre de esa ventana
+            trade: Trade colocado en esa ventana, o None si no hubo
+            skip_reason: Razón por la que no se operó (si trade is None)
+            current_btc_price: Precio actual de BTC (inicio de nueva ventana)
+            stats: Diccionario de estadísticas del RiskManager
+            dry_run: True si el bot está en modo simulación
+        """
+        # Movimiento real de BTC en la ventana anterior
+        actual_went_up = close_price > open_price
+        actual_emoji = "⬆️" if actual_went_up else "⬇️"
+        actual_dir = "UP" if actual_went_up else "DOWN"
+
+        # Slug con guiones escapados para MarkdownV2
+        slug_escaped = _escape_mdv2(window_slug)
+        open_str = _escape_mdv2(f"${open_price:,.2f}")
+        close_str = _escape_mdv2(f"${close_price:,.2f}")
+
+        lines: list[str] = [
+            "📊 *Resumen ventana anterior*",
+            f"⏱ Ventana: `{slug_escaped}`",
+            f"📈 BTC apertura: `{open_str}` → cierre: `{close_str}`",
+            f"📉 Resultado real: {actual_emoji} {actual_dir}",
+        ]
+
+        if trade is not None and trade.resolved:
+            result_emoji = "✅" if trade.won else "❌"
+            win_str = "GANÓ" if trade.won else "PERDIÓ"
+            pnl_sign = "\\+" if trade.pnl_usdc >= 0 else ""
+            pnl_val = _escape_mdv2(f"${abs(trade.pnl_usdc):.2f}")
+            pnl_display = f"{pnl_sign}{pnl_val}"
+            price_str = _escape_mdv2(f"${trade.token_price:.2f}")
+
+            lines.append(
+                f"\n🤖 *Bot apostó:* {trade.direction} @ `{price_str}`"
+            )
+
+            if dry_run:
+                lines.append(
+                    f"🧪 \\[SIM\\] Resultado: {result_emoji} {win_str} "
+                    f"\\({pnl_display}\\)"
+                )
+            else:
+                lines.append(
+                    f"💰 \\[REAL\\] Resultado: {result_emoji} {win_str} "
+                    f"\\({pnl_display}\\)"
+                )
+        else:
+            # No se apostó en esta ventana
+            reason = skip_reason or "Sin señal en esta ventana"
+            reason_escaped = _escape_mdv2(reason)
+            lines.append(f"\n⏭️ No apostó esta ventana \\({reason_escaped}\\)")
+
+        # Estado actual
+        wins = stats.get("wins", 0)
+        losses = stats.get("losses", 0)
+        win_rate = stats.get("win_rate", 0.0)
+        daily_pnl = stats.get("daily_pnl_usdc", 0.0)
+
+        pnl_sign = "\\+" if daily_pnl >= 0 else "\\-"
+        pnl_abs = _escape_mdv2(f"${abs(daily_pnl):.2f}")
+        winrate_pct = _escape_mdv2(f"{win_rate:.0%}")
+        btc_now_str = _escape_mdv2(f"${current_btc_price:,.2f}")
+
+        lines.extend([
+            "\n📊 *Estado actual*",
+            f"💵 BTC ahora: `{btc_now_str}`",
+            f"📅 P&L hoy: `{pnl_sign}{pnl_abs}`",
+            f"🏆 Winrate: `{winrate_pct}` \\({wins}W / {losses}L\\)",
+        ])
+
+        message = "\n".join(lines)
+        await self._send_mdv2(message)
 
     async def notify_bot_stop(self, reason: str = "Manual") -> None:
         """

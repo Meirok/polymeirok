@@ -71,6 +71,14 @@ class Config:
         default_factory=lambda: _get_float("STOP_LOSS_DAILY_USD", 20.0)
     )
 
+    # --- Latency Sniper ---
+    sniper_threshold: float = field(
+        default_factory=lambda: _get_float("SNIPER_THRESHOLD", 0.08)
+    )
+    sniper_min_seconds_left: int = field(
+        default_factory=lambda: _get_int("SNIPER_MIN_SECONDS_LEFT", 60)
+    )
+
     # --- Notificaciones Telegram ---
     telegram_bot_token: Optional[str] = field(
         default_factory=lambda: os.getenv("TELEGRAM_BOT_TOKEN")

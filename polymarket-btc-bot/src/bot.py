@@ -9,11 +9,12 @@ import time
 from typing import Optional
 
 from .config import Config
+from .latency_sniper import LatencySniper
 from .logger import get_logger
 from .notifier import Notifier
 from .polymarket_client import PolymarketClient
 from .price_feed import PriceFeed
-from .risk_manager import RiskManager
+from .risk_manager import RiskManager, Trade
 from .strategy import Strategy
 
 logger = get_logger("bot")
@@ -33,10 +34,12 @@ class TradingBot:
     Flujo por ventana de 5 minutos:
     1. Detectar nueva ventana via aritmética de timestamps
     2. Registrar precio de apertura de la ventana
-    3. En T-ENTRY_SECONDS antes del cierre: analizar señal
-    4. Si señal válida y reglas de riesgo pasan: colocar orden
-    5. Al cerrar la ventana: resolver trade y actualizar PnL
-    6. Notificar resultado por Telegram
+    3. Cada segundo: verificar si el Latency Sniper detecta un movimiento brusco
+    4. En T-ENTRY_SECONDS antes del cierre: analizar señal direccional (si no operó sniper)
+    5. Si señal válida y reglas de riesgo pasan: colocar orden
+    6. Al cerrar la ventana: resolver trade y actualizar PnL
+    7. Enviar resumen de ventana por Telegram al inicio de la nueva ventana
+    8. Notificar resultado por Telegram
     """
 
     def __init__(self, config: Config) -> None:
@@ -45,6 +48,7 @@ class TradingBot:
         # Componentes del bot
         self.feed = PriceFeed(config.binance_ws_url)
         self.strategy = Strategy(self.feed)
+        self.sniper = LatencySniper(self.feed, config)
         self.polymarket = PolymarketClient(config)
         self.risk_manager = RiskManager(config)
         self.notifier = Notifier(config)
@@ -55,6 +59,9 @@ class TradingBot:
         self._window_open_price: float = 0.0
         self._traded_this_window: bool = False
         self._last_entry_attempt: int = 0
+
+        # Razón por la que no se operó esta ventana (para el resumen)
+        self._window_skip_reason: str = ""
 
         # Control del bot
         self._running: bool = False
@@ -79,6 +86,10 @@ class TradingBot:
         logger.info(f"Confianza mínima: {self.config.min_confidence:.0%}")
         logger.info(f"Odds: {self.config.min_odds} - {self.config.max_odds}")
         logger.info(f"Stop-loss diario: ${self.config.stop_loss_daily_usd:.2f}")
+        logger.info(
+            f"Sniper: umbral={self.config.sniper_threshold}% | "
+            f"mín. segundos restantes={self.config.sniper_min_seconds_left}s"
+        )
         logger.info("=" * 60)
 
         # Iniciar feed de precios y bucle principal en paralelo
@@ -156,6 +167,8 @@ class TradingBot:
         self._current_window_slug = f"btc-updown-5m-{self._current_window_ts}"
         self._traded_this_window = False
         self._last_entry_attempt = 0
+        self._window_skip_reason = ""
+        self.sniper.reset_window()
 
         if self.feed.last_price > 0:
             self._window_open_price = self.feed.last_price
@@ -180,7 +193,25 @@ class TradingBot:
             await self._on_new_window(current_window_ts)
             return
 
-        # --- Verificar si hay que intentar entrada ---
+        # --- Actualizar sniper con precio actual cada segundo ---
+        self.sniper.update()
+
+        # --- Verificar señal del Latency Sniper ---
+        # El sniper puede actuar en cualquier momento cuando quedan > MIN segundos
+        if not self._traded_this_window and self.feed.last_price > 0:
+            sniper_signal = self.sniper.check_signal(seconds_until_close)
+            if sniper_signal is not None:
+                logger.info(
+                    f"[SNIPER] Señal detectada: {sniper_signal.direction} | "
+                    f"Movimiento: {sniper_signal.breakdown.get('sniper_move_10s_pct', 0):+.4f}% | "
+                    f"Cierre en: {seconds_until_close}s"
+                )
+                await self._try_enter_trade(
+                    trade_type="SNIPER", forced_signal=sniper_signal
+                )
+                return
+
+        # --- Verificar si hay que intentar entrada direccional ---
         entry_window_start = 300 - self.config.entry_seconds_before
         is_entry_time = seconds_in_window >= entry_window_start
         already_attempted = self._last_entry_attempt == current_window_ts
@@ -192,7 +223,7 @@ class TradingBot:
             and self.feed.last_price > 0
         ):
             self._last_entry_attempt = current_window_ts
-            await self._try_enter_trade()
+            await self._try_enter_trade(trade_type="DIRECTIONAL")
 
         # Log periódico del estado (cada 30 segundos)
         if seconds_in_window % 30 == 0 and seconds_in_window > 0:
@@ -201,21 +232,46 @@ class TradingBot:
     async def _on_new_window(self, new_window_ts: int) -> None:
         """
         Maneja la transición a una nueva ventana de 5 minutos.
+        Resuelve trades pendientes, envía resumen de ventana, e inicializa la nueva.
 
         Args:
             new_window_ts: Timestamp de la nueva ventana
         """
         logger.info(f"Nueva ventana detectada: {new_window_ts}")
 
+        # Capturar datos de la ventana que cierra para el resumen
+        prev_slug = self._current_window_slug
+        prev_open = self._window_open_price
+        prev_close = self.feed.last_price  # Precio al cierre = precio al inicio de la nueva
+        prev_traded = self._traded_this_window
+        prev_skip_reason = self._window_skip_reason
+
         # Resolver trades pendientes de la ventana anterior
-        if self._current_window_slug and self._traded_this_window:
-            await self._resolve_pending_trades()
+        resolved_trade: Optional[Trade] = None
+        if prev_slug and prev_traded:
+            resolved_trade = await self._resolve_pending_trades()
+
+        # Enviar resumen de la ventana que acaba de cerrar
+        if prev_slug and prev_open > 0:
+            stats = self.risk_manager.get_stats()
+            await self.notifier.notify_window_summary(
+                window_slug=prev_slug,
+                open_price=prev_open,
+                close_price=prev_close,
+                trade=resolved_trade,
+                skip_reason=prev_skip_reason,
+                current_btc_price=self.feed.last_price,
+                stats=stats,
+                dry_run=self.config.dry_run,
+            )
 
         # Inicializar nueva ventana
         self._current_window_ts = new_window_ts
         self._current_window_slug = f"btc-updown-5m-{new_window_ts}"
         self._traded_this_window = False
         self._last_entry_attempt = 0
+        self._window_skip_reason = ""
+        self.sniper.reset_window()
 
         # Precio de apertura de la nueva ventana
         self._window_open_price = self.feed.last_price
@@ -233,11 +289,21 @@ class TradingBot:
                 f"Bot detenido por stop-loss. PnL diario: ${daily_pnl:+.2f} USDC"
             )
 
-    async def _try_enter_trade(self) -> None:
+    async def _try_enter_trade(
+        self,
+        trade_type: str = "DIRECTIONAL",
+        forced_signal=None,
+    ) -> None:
         """
         Intenta entrar en un trade para la ventana actual.
 
-        1. Genera señal de la estrategia
+        Args:
+            trade_type: "DIRECTIONAL" o "SNIPER"
+            forced_signal: Signal pre-generada por el sniper (si aplica).
+                           Si es None, se genera una señal con la estrategia técnica.
+
+        Flujo:
+        1. Genera señal (estrategia técnica o sniper)
         2. Verifica reglas de riesgo
         3. Obtiene mercado de Polymarket
         4. Coloca la orden
@@ -246,17 +312,22 @@ class TradingBot:
         """
         seconds_until_close = self._seconds_until_close()
         logger.info(
-            f"Analizando señal para {self._current_window_slug} | "
+            f"[{trade_type}] Analizando señal para {self._current_window_slug} | "
             f"Cierra en {seconds_until_close}s | "
             f"BTC: ${self.feed.last_price:,.2f}"
         )
 
         # 1. Generar señal
-        signal = self.strategy.analyze()
-        logger.info(f"Señal generada: {signal}")
+        if forced_signal is not None:
+            signal = forced_signal
+        else:
+            signal = self.strategy.analyze()
+
+        logger.info(f"[{trade_type}] Señal generada: {signal}")
 
         if signal.direction == "SKIP":
-            logger.info("Señal SKIP — no se opera en esta ventana")
+            logger.info(f"[{trade_type}] Señal SKIP — no se opera en esta ventana")
+            self._window_skip_reason = "Señal SKIP"
             return
 
         # 2. Obtener mercado de Polymarket para conocer precios de tokens
@@ -269,14 +340,15 @@ class TradingBot:
                 token_price = 0.65  # Precio simulado
                 token_id = f"SIM-TOKEN-{signal.direction}"
                 logger.info(
-                    f"[SIMULACIÓN] Mercado no encontrado. "
+                    f"[{trade_type}] [SIMULACIÓN] Mercado no encontrado. "
                     f"Usando precio simulado: {token_price}"
                 )
             else:
                 logger.warning(
-                    f"Mercado no encontrado para {self._current_window_slug}. "
+                    f"[{trade_type}] Mercado no encontrado para {self._current_window_slug}. "
                     f"Saltando trade."
                 )
+                self._window_skip_reason = "Mercado no encontrado"
                 return
         else:
             # Seleccionar token según dirección
@@ -288,7 +360,8 @@ class TradingBot:
                 token_price = market.down_price
 
             if not market.is_active:
-                logger.warning("Mercado inactivo — saltando trade")
+                logger.warning(f"[{trade_type}] Mercado inactivo — saltando trade")
+                self._window_skip_reason = "Mercado inactivo"
                 return
 
         # 3. Verificar reglas de riesgo
@@ -299,12 +372,13 @@ class TradingBot:
         )
 
         if not can_trade:
-            logger.info(f"Trade bloqueado por riesgo: {reason}")
+            logger.info(f"[{trade_type}] Trade bloqueado por riesgo: {reason}")
+            self._window_skip_reason = reason
             return
 
         # 4. Colocar orden
         logger.info(
-            f"Colocando orden {signal.direction} | "
+            f"[{trade_type}] Colocando orden {signal.direction} | "
             f"Token: {token_price:.4f} | "
             f"Monto: ${self.config.bet_amount_usdc:.2f} USDC | "
             f"Confianza: {signal.confidence:.1%}"
@@ -318,11 +392,12 @@ class TradingBot:
         )
 
         if not order_result.success:
-            logger.error(f"Error al colocar orden: {order_result.error}")
+            logger.error(f"[{trade_type}] Error al colocar orden: {order_result.error}")
             await self.notifier.notify_error(
                 error=f"Error de orden: {order_result.error}",
                 context=self._current_window_slug,
             )
+            self._window_skip_reason = f"Error de orden: {order_result.error}"
             return
 
         # 5. Registrar trade en el gestor de riesgo
@@ -336,6 +411,7 @@ class TradingBot:
             tokens_bought=order_result.tokens_bought,
             confidence=signal.confidence,
             simulated=order_result.simulated,
+            trade_type=trade_type,
         )
 
         self._traded_this_window = True
@@ -350,16 +426,19 @@ class TradingBot:
             signal_breakdown=signal.breakdown,
         )
 
-    async def _resolve_pending_trades(self) -> None:
+    async def _resolve_pending_trades(self) -> Optional[Trade]:
         """
         Resuelve trades pendientes de la ventana anterior.
         Usa el precio actual de BTC como precio de cierre.
+
+        Returns:
+            Trade resuelto, o None si no había trades pendientes.
         """
         close_price = self.feed.last_price
 
         if close_price <= 0:
             logger.warning("Precio de cierre inválido — no se puede resolver trade")
-            return
+            return None
 
         logger.info(
             f"Resolviendo trades de {self._current_window_slug} | "
@@ -384,6 +463,8 @@ class TradingBot:
                     daily_pnl=daily_pnl,
                     limit=self.config.stop_loss_daily_usd,
                 )
+
+        return resolved_trade
 
     def _log_status(self, seconds_until_close: int) -> None:
         """Loguea el estado actual del bot de forma periódica."""

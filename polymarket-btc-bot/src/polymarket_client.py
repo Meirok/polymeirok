@@ -30,6 +30,7 @@ class MarketInfo:
     down_price: float                 # Precio actual del token DOWN (0-1)
     is_active: bool                   # Si el mercado está activo
     end_date_iso: str = ""            # Fecha de cierre del mercado
+    orderbook_price_available: bool = True  # False si el precio viene del fallback/default
     extra: dict = field(default_factory=dict)
 
 
@@ -192,11 +193,19 @@ class PolymarketClient:
                     up_token_id = str(clob_token_ids[0])
                     down_token_id = str(clob_token_ids[1])
 
-                # Intentar obtener precios actuales del orderbook
+                # Intentar obtener precios actuales del orderbook (con fallback Gamma)
+                orderbook_price_available = False
                 if up_token_id:
-                    prices = await self._get_token_prices(up_token_id, down_token_id)
-                    if prices:
-                        up_price, down_price = prices
+                    prices = await self._get_token_prices(
+                        up_token_id, down_token_id, gamma_market_data=market
+                    )
+                    if prices is not None:
+                        up_price, down_price, orderbook_price_available = prices
+
+                if not orderbook_price_available:
+                    logger.warning(
+                        "Precio de orderbook no disponible — omitiendo filtro de odds"
+                    )
 
                 return MarketInfo(
                     market_id=str(market.get("id", "")),
@@ -209,6 +218,7 @@ class PolymarketClient:
                     down_price=down_price,
                     is_active=market.get("active", False),
                     end_date_iso=market.get("endDate", ""),
+                    orderbook_price_available=orderbook_price_available,
                     extra=market,
                 )
 
@@ -220,46 +230,137 @@ class PolymarketClient:
             return None
 
     async def _get_token_prices(
-        self, up_token_id: str, down_token_id: str
-    ) -> Optional[tuple[float, float]]:
+        self, up_token_id: str, down_token_id: str, gamma_market_data: Optional[dict] = None
+    ) -> Optional[tuple[float, float, bool]]:
         """
-        Obtiene los precios actuales de los tokens UP y DOWN desde el CLOB.
+        Obtiene los precios actuales de los tokens UP y DOWN.
+
+        Intenta primero el CLOB orderbook. Si falla, intenta extraer precios
+        del Gamma API (outcomePrices). Retorna None sólo si ambas fuentes fallan.
 
         Args:
             up_token_id: ID del token UP
             down_token_id: ID del token DOWN
+            gamma_market_data: Datos de mercado ya obtenidos del Gamma API (fallback)
 
         Returns:
-            Tupla (up_price, down_price) o None si hay error
+            Tupla (up_price, down_price, prices_available) o None si ambas fuentes fallan.
+            prices_available=False indica precios del fallback Gamma, no del CLOB.
         """
+        up_price = 0.5
+        down_price = 0.5
+        up_obtained = False
+        down_obtained = False
+
         try:
             session = await self._get_session()
             url = f"{self.config.clob_api_base}/book"
 
-            # Obtener precio del token UP
-            up_price = 0.5
-            down_price = 0.5
+            # Obtener precio del token UP desde el CLOB
+            try:
+                async with session.get(url, params={"token_id": up_token_id}) as resp:
+                    if resp.status == 200:
+                        book = await resp.json()
+                        asks = book.get("asks", [])
+                        if asks:
+                            up_price = float(asks[0].get("price", 0.5))
+                            up_obtained = True
+                        else:
+                            logger.warning(
+                                f"CLOB orderbook UP ({up_token_id[:12]}…) sin asks — "
+                                f"respuesta vacía: {book}"
+                            )
+                    else:
+                        body = await resp.text()
+                        logger.warning(
+                            f"CLOB orderbook UP falló: HTTP {resp.status} | "
+                            f"token={up_token_id[:12]}… | body={body[:200]}"
+                        )
+            except Exception as e:
+                logger.error(f"Error en petición CLOB orderbook UP: {e}", exc_info=True)
 
-            async with session.get(url, params={"token_id": up_token_id}) as resp:
-                if resp.status == 200:
-                    book = await resp.json()
-                    # El mejor ask (precio de compra más barato disponible)
-                    asks = book.get("asks", [])
-                    if asks:
-                        up_price = float(asks[0].get("price", 0.5))
-
-            async with session.get(url, params={"token_id": down_token_id}) as resp:
-                if resp.status == 200:
-                    book = await resp.json()
-                    asks = book.get("asks", [])
-                    if asks:
-                        down_price = float(asks[0].get("price", 0.5))
-
-            return up_price, down_price
+            # Obtener precio del token DOWN desde el CLOB
+            try:
+                async with session.get(url, params={"token_id": down_token_id}) as resp:
+                    if resp.status == 200:
+                        book = await resp.json()
+                        asks = book.get("asks", [])
+                        if asks:
+                            down_price = float(asks[0].get("price", 0.5))
+                            down_obtained = True
+                        else:
+                            logger.warning(
+                                f"CLOB orderbook DOWN ({down_token_id[:12]}…) sin asks — "
+                                f"respuesta vacía: {book}"
+                            )
+                    else:
+                        body = await resp.text()
+                        logger.warning(
+                            f"CLOB orderbook DOWN falló: HTTP {resp.status} | "
+                            f"token={down_token_id[:12]}… | body={body[:200]}"
+                        )
+            except Exception as e:
+                logger.error(f"Error en petición CLOB orderbook DOWN: {e}", exc_info=True)
 
         except Exception as e:
-            logger.debug(f"Error obteniendo precios del CLOB: {e}")
-            return None
+            logger.error(f"Error general obteniendo precios del CLOB: {e}", exc_info=True)
+
+        # Si CLOB devolvió precios reales, retornar
+        if up_obtained and down_obtained:
+            return up_price, down_price, True
+
+        # --- Fallback: intentar obtener precios del Gamma API ---
+        if gamma_market_data is not None:
+            gamma_prices = self._extract_gamma_prices(gamma_market_data)
+            if gamma_prices:
+                gup, gdown = gamma_prices
+                logger.info(
+                    f"Precios obtenidos del Gamma API como fallback — "
+                    f"UP: {gup:.4f} | DOWN: {gdown:.4f}"
+                )
+                return gup, gdown, False
+
+        # Ambas fuentes fallaron
+        if not up_obtained or not down_obtained:
+            logger.warning(
+                "No se pudo obtener precio del CLOB ni del Gamma API — "
+                "precio de orderbook no disponible"
+            )
+        return None
+
+    def _extract_gamma_prices(self, market_data: dict) -> Optional[tuple[float, float]]:
+        """
+        Extrae precios UP/DOWN de los datos del Gamma API.
+
+        Intenta los campos: outcomePrices, bestBid/bestAsk por token.
+
+        Args:
+            market_data: Diccionario de mercado retornado por el Gamma API
+
+        Returns:
+            Tupla (up_price, down_price) o None si no se pueden extraer
+        """
+        try:
+            # Campo outcomePrices: lista de strings ["0.55", "0.45"]
+            outcome_prices = market_data.get("outcomePrices")
+            if outcome_prices and len(outcome_prices) >= 2:
+                up = float(outcome_prices[0])
+                down = float(outcome_prices[1])
+                if 0.0 < up < 1.0 and 0.0 < down < 1.0:
+                    return up, down
+
+            # Campo tokens con price embebido
+            tokens = market_data.get("tokens", [])
+            if len(tokens) >= 2:
+                up = float(tokens[0].get("price", 0.0))
+                down = float(tokens[1].get("price", 0.0))
+                if 0.0 < up < 1.0 and 0.0 < down < 1.0:
+                    return up, down
+
+        except (ValueError, TypeError, KeyError) as e:
+            logger.debug(f"Error extrayendo precios del Gamma API: {e}")
+
+        return None
 
     async def place_order(
         self,

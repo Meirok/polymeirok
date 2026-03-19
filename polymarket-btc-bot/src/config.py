@@ -55,7 +55,7 @@ class Config:
         default_factory=lambda: _get_float("BET_AMOUNT_USDC", 1.0)
     )
     min_confidence: float = field(
-        default_factory=lambda: _get_float("MIN_CONFIDENCE", 0.65)
+        default_factory=lambda: _get_float("MIN_CONFIDENCE", 0.55)
     )
     min_odds: float = field(default_factory=lambda: _get_float("MIN_ODDS", 0.55))
     max_odds: float = field(default_factory=lambda: _get_float("MAX_ODDS", 0.92))

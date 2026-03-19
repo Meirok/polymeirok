@@ -378,9 +378,18 @@ class TradingBot:
                 return
 
         # 3. Verificar reglas de riesgo
+        # Si el precio del orderbook no está disponible, omitir el filtro de odds
+        # pasando un precio neutro que cae dentro del rango válido.
+        price_for_risk_check = token_price
+        if market is not None and not market.orderbook_price_available:
+            logger.info(
+                "Precio de orderbook no disponible — omitiendo filtro de odds"
+            )
+            price_for_risk_check = (self.config.min_odds + self.config.max_odds) / 2
+
         can_trade, reason = self.risk_manager.can_trade(
             confidence=signal.confidence,
-            token_price=token_price,
+            token_price=price_for_risk_check,
             window_slug=self._current_window_slug,
         )
 

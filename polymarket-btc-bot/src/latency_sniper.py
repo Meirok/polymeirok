@@ -96,9 +96,21 @@ class LatencySniper:
         # Movimiento detectado — generar señal
         direction = "UP" if move_pct > 0 else "DOWN"
 
-        # Confianza proporcional al tamaño del movimiento relativo al umbral,
-        # con un techo razonable. Movimiento del doble del umbral → 0.80 confianza.
-        confidence = min(0.95, abs(move_pct) / threshold * 0.5)
+        # Confianza piecewise-linear calibrada según la magnitud del movimiento:
+        #   >= threshold (0.05%) → mínimo 60%
+        #   >= 0.08%             → 70%
+        #   >= 0.12%             → 80%
+        #   >= 0.20%             → 90%  (techo máximo 95%)
+        move = abs(move_pct)
+        if move >= 0.20:
+            confidence = min(0.95, 0.90 + (move - 0.20) * 1.25)
+        elif move >= 0.12:
+            confidence = 0.80 + (move - 0.12) / 0.08 * 0.10
+        elif move >= 0.08:
+            confidence = 0.70 + (move - 0.08) / 0.04 * 0.10
+        else:
+            # Interpolar entre 0.60 (en threshold) y 0.70 (en 0.08%)
+            confidence = 0.60 + (move - threshold) / (0.08 - threshold) * 0.10
 
         logger.info(
             f"[SNIPER] Movimiento detectado: {move_pct:+.4f}% en 10s "

@@ -75,8 +75,11 @@ class Config:
     sniper_threshold: float = field(
         default_factory=lambda: _get_float("SNIPER_THRESHOLD", 0.05)
     )
-    sniper_min_seconds_left: int = field(
-        default_factory=lambda: _get_int("SNIPER_MIN_SECONDS_LEFT", 60)
+    sniper_entry_window_max: int = field(
+        default_factory=lambda: _get_int("SNIPER_ENTRY_WINDOW_MAX", 30)
+    )
+    sniper_entry_window_min: int = field(
+        default_factory=lambda: _get_int("SNIPER_ENTRY_WINDOW_MIN", 5)
     )
 
     # --- Notificaciones Telegram ---

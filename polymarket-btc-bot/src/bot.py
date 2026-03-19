@@ -64,6 +64,9 @@ class TradingBot:
         self._sniper_peak_move_pct: float = 0.0
         self._sniper_peak_move_second: int = 0
 
+        # Movimiento detectado en el momento de entrada (T-30s a T-5s)
+        self._sniper_entry_move_pct: float = 0.0
+
         # Control del bot
         self._running: bool = False
 
@@ -89,7 +92,7 @@ class TradingBot:
         logger.info(f"Stop-loss diario: ${self.config.stop_loss_daily_usd:.2f}")
         logger.info(
             f"Sniper: umbral={self.config.sniper_threshold}% | "
-            f"mín. segundos restantes={self.config.sniper_min_seconds_left}s"
+            f"ventana de entrada={self.config.sniper_entry_window_min}s-{self.config.sniper_entry_window_max}s antes del cierre"
         )
         logger.info("=" * 60)
 
@@ -170,6 +173,7 @@ class TradingBot:
         self._window_skip_reason = ""
         self._sniper_peak_move_pct = 0.0
         self._sniper_peak_move_second = 0
+        self._sniper_entry_move_pct = 0.0
         self.sniper.reset_window()
 
         if self.feed.last_price > 0:
@@ -209,14 +213,15 @@ class TradingBot:
                     self._sniper_peak_move_pct = move_pct
                     self._sniper_peak_move_second = seconds_in_window
 
-        # --- Verificar señal del Latency Sniper ---
-        # El sniper puede actuar en cualquier momento cuando quedan > MIN segundos
+        # --- Verificar señal del Latency Sniper (solo en T-30s a T-5s) ---
         if not self._traded_this_window and self.feed.last_price > 0:
             sniper_signal = self.sniper.check_signal(seconds_until_close)
             if sniper_signal is not None:
+                entry_move = sniper_signal.breakdown.get('sniper_move_10s_pct', 0.0)
+                self._sniper_entry_move_pct = entry_move
                 logger.info(
                     f"[SNIPER] Señal detectada: {sniper_signal.direction} | "
-                    f"Movimiento: {sniper_signal.breakdown.get('sniper_move_10s_pct', 0):+.4f}% | "
+                    f"Movimiento: {entry_move:+.4f}% | "
                     f"Cierre en: {seconds_until_close}s"
                 )
                 await self._try_enter_trade(
@@ -246,6 +251,7 @@ class TradingBot:
         prev_skip_reason = self._window_skip_reason
         prev_sniper_peak_move_pct = self._sniper_peak_move_pct
         prev_sniper_peak_move_second = self._sniper_peak_move_second
+        prev_sniper_entry_move_pct = self._sniper_entry_move_pct
         new_window_slug = f"btc-updown-5m-{new_window_ts}"
 
         # Resolver trades pendientes de la ventana anterior
@@ -268,6 +274,7 @@ class TradingBot:
                 dry_run=self.config.dry_run,
                 sniper_peak_move_pct=prev_sniper_peak_move_pct,
                 sniper_peak_move_second=prev_sniper_peak_move_second,
+                sniper_entry_move_pct=prev_sniper_entry_move_pct,
             )
 
         # Inicializar nueva ventana
@@ -277,6 +284,7 @@ class TradingBot:
         self._window_skip_reason = ""
         self._sniper_peak_move_pct = 0.0
         self._sniper_peak_move_second = 0
+        self._sniper_entry_move_pct = 0.0
         self.sniper.reset_window()
 
         # Precio de apertura de la nueva ventana

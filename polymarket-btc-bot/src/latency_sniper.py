@@ -23,10 +23,11 @@ class LatencySniper:
     """
     Estrategia de sniper por latencia: detecta movimientos bruscos de precio.
 
-    Monitorea el precio de BTC cada segundo. Si detecta un movimiento
-    mayor al umbral configurado en los últimos 10 segundos, y quedan
-    más de SNIPER_MIN_SECONDS_LEFT segundos en la ventana actual,
-    genera una señal de entrada inmediata.
+    Monitorea el precio de BTC cada segundo durante toda la ventana.
+    Solo genera señal de entrada en los últimos segundos de la ventana
+    (entre SNIPER_ENTRY_WINDOW_MAX y SNIPER_ENTRY_WINDOW_MIN segundos antes
+    del cierre). Esto captura el edge de entrar cuando la dirección del precio
+    ya está prácticamente definida y no hay tiempo para una reversión.
 
     El tipo de trade generado es "SNIPER" para diferenciarlo del
     tipo "DIRECTIONAL" de la estrategia técnica.
@@ -67,8 +68,12 @@ class LatencySniper:
         if self._attempted_this_window:
             return None
 
-        # Verificar que queden suficientes segundos
-        if seconds_until_close <= self.config.sniper_min_seconds_left:
+        # Solo actuar en la ventana de entrada final: entre T-MAX y T-MIN segundos
+        if not (
+            self.config.sniper_entry_window_min
+            <= seconds_until_close
+            <= self.config.sniper_entry_window_max
+        ):
             return None
 
         # Necesitamos al menos 10 muestras para evaluar el movimiento

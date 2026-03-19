@@ -298,6 +298,7 @@ class Notifier:
         dry_run: bool,
         sniper_peak_move_pct: float = 0.0,
         sniper_peak_move_second: int = 0,
+        sniper_entry_move_pct: float = 0.0,
     ) -> None:
         """
         Envía el resumen de la ventana de 5 minutos que acaba de cerrar.
@@ -315,6 +316,7 @@ class Notifier:
             dry_run: True si el bot está en modo simulación
             sniper_peak_move_pct: Mayor movimiento % detectado por el sniper en la ventana
             sniper_peak_move_second: Segundo de la ventana donde se detectó el pico
+            sniper_entry_move_pct: Movimiento % detectado al momento de entrada (T-30s a T-5s); 0.0 si no hubo intento
         """
         # --- Header: nueva ventana ---
         new_slug_escaped = _escape_mdv2(new_window_slug)
@@ -336,6 +338,12 @@ class Notifier:
         threshold_str = _escape_mdv2(f"{self.config.sniper_threshold:.2f}%")
         peak_second_str = _escape_mdv2(str(sniper_peak_move_second))
 
+        entry_abs = abs(sniper_entry_move_pct)
+        entry_sign = "\\+" if sniper_entry_move_pct >= 0 else "\\-"
+        entry_str = _escape_mdv2(f"{entry_abs:.3f}%")
+        threshold_crossed = entry_abs > self.config.sniper_threshold
+        threshold_emoji = "✅" if threshold_crossed else "❌"
+
         lines: list[str] = [
             f"🕐 *Nueva ventana — {new_slug_escaped}*",
             f"📊 *Ventana anterior*",
@@ -343,10 +351,20 @@ class Notifier:
             f"📉 BTC cierre: {close_str}",
             f"➡️ Movimiento: {move_sign}{move_str} {move_emoji} {move_dir}",
             f"🎯 *Sniper*",
-            f"Mayor movimiento detectado: {peak_sign}{peak_str} a los {peak_second_str}s",
-            f"Umbral configurado: {threshold_str}",
-            f"🤖 *Bot*",
+            f"Mayor movimiento ventana: {peak_sign}{peak_str} a los {peak_second_str}s",
         ]
+
+        if sniper_entry_move_pct != 0.0:
+            lines.append(
+                f"Movimiento en entrada \\(T\\-30s\\): {entry_sign}{entry_str} "
+                f"{threshold_emoji} \\(umbral: {threshold_str}\\)"
+            )
+        else:
+            lines.append(
+                f"Sin entrada en ventana final \\(umbral: {threshold_str}\\)"
+            )
+
+        lines.append(f"🤖 *Bot*")
 
         if trade is not None and trade.resolved:
             price_str = _escape_mdv2(f"${trade.token_price:.2f}")

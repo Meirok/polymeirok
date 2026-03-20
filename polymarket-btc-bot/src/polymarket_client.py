@@ -106,6 +106,10 @@ class PolymarketClient:
         Inicializa el cliente CLOB de py-clob-client.
         Solo aplica en modo producción.
 
+        For SIGNATURE_TYPE=0 (EOA wallet, no proxy), the client must be created
+        WITHOUT the funder parameter, then API credentials must be derived via
+        derive_api_key() before placing any order.
+
         Returns:
             True si se inicializó correctamente, False en caso contrario
         """
@@ -115,21 +119,45 @@ class PolymarketClient:
         try:
             from py_clob_client.client import ClobClient
 
-            clob_kwargs = {
-                "host": self.config.clob_api_base,
-                "chain_id": 137,  # Polygon Mainnet
-                "key": self.config.private_key,
-                "signature_type": self.config.signature_type,
-            }
+            sig_type = self.config.signature_type
+            logger.info(
+                f"[CLOB INIT] Inicializando cliente CLOB — "
+                f"signature_type={sig_type} | "
+                f"proxy_address={self.config.polymarket_proxy_address or 'none'}"
+            )
 
-            # Only pass funder if signature_type != 0 or proxy address is set
-            if self.config.signature_type != 0 or self.config.polymarket_proxy_address:
-                clob_kwargs["funder"] = self.config.polymarket_proxy_address
+            if sig_type == 0:
+                # EOA wallet: no proxy, no funder param
+                self._clob_client = ClobClient(
+                    host=self.config.clob_api_base,
+                    chain_id=137,  # Polygon Mainnet
+                    key=self.config.private_key,
+                    signature_type=0,
+                )
+                logger.info("[CLOB INIT] EOA mode (signature_type=0): ClobClient created WITHOUT funder")
+            else:
+                # Proxy / browser-extension wallet: pass funder
+                self._clob_client = ClobClient(
+                    host=self.config.clob_api_base,
+                    chain_id=137,
+                    key=self.config.private_key,
+                    signature_type=sig_type,
+                    funder=self.config.polymarket_proxy_address,
+                )
+                logger.info(
+                    f"[CLOB INIT] Proxy mode (signature_type={sig_type}): "
+                    f"ClobClient created WITH funder={self.config.polymarket_proxy_address}"
+                )
 
-            self._clob_client = ClobClient(**clob_kwargs)
+            # Derive L2 API credentials from the private key
+            logger.info("[CLOB INIT] Deriving API credentials via derive_api_key()…")
+            api_creds = self._clob_client.derive_api_key()
+            self._clob_client.set_api_creds(api_creds)
+            logger.info(
+                f"[CLOB INIT] API credentials set — "
+                f"api_key={getattr(api_creds, 'api_key', '<unknown>')[:8]}…"
+            )
 
-            # Derivar credenciales desde la clave privada
-            self._clob_client.set_api_creds(self._clob_client.create_or_derive_api_creds())
             logger.info("Cliente CLOB inicializado en modo producción")
             return True
 
@@ -585,13 +613,27 @@ class PolymarketClient:
                     if resp.status == 200:
                         book = await resp.json()
                         asks = book.get("asks", [])
+                        bids = book.get("bids", [])
                         if asks:
                             up_price = float(asks[0].get("price", 0.5))
                             up_obtained = True
+                            logger.debug(
+                                f"CLOB orderbook UP — best ask: {up_price:.4f} "
+                                f"(token={up_token_id[:12]}…)"
+                            )
+                        elif bids:
+                            # asks empty: use best bid + 0.01 as price estimate
+                            best_bid = float(bids[0].get("price", 0.5))
+                            up_price = min(best_bid + 0.01, 0.99)
+                            up_obtained = True
+                            logger.info(
+                                f"CLOB orderbook UP sin asks — usando best bid {best_bid:.4f} + 0.01 "
+                                f"= {up_price:.4f} (token={up_token_id[:12]}…)"
+                            )
                         else:
                             logger.warning(
-                                f"CLOB orderbook UP ({up_token_id[:12]}…) sin asks — "
-                                f"respuesta vacía: {book}"
+                                f"CLOB orderbook UP ({up_token_id[:12]}…) sin asks ni bids — "
+                                f"respuesta: {book}"
                             )
                     else:
                         body = await resp.text()
@@ -608,13 +650,27 @@ class PolymarketClient:
                     if resp.status == 200:
                         book = await resp.json()
                         asks = book.get("asks", [])
+                        bids = book.get("bids", [])
                         if asks:
                             down_price = float(asks[0].get("price", 0.5))
                             down_obtained = True
+                            logger.debug(
+                                f"CLOB orderbook DOWN — best ask: {down_price:.4f} "
+                                f"(token={down_token_id[:12]}…)"
+                            )
+                        elif bids:
+                            # asks empty: use best bid + 0.01 as price estimate
+                            best_bid = float(bids[0].get("price", 0.5))
+                            down_price = min(best_bid + 0.01, 0.99)
+                            down_obtained = True
+                            logger.info(
+                                f"CLOB orderbook DOWN sin asks — usando best bid {best_bid:.4f} + 0.01 "
+                                f"= {down_price:.4f} (token={down_token_id[:12]}…)"
+                            )
                         else:
                             logger.warning(
-                                f"CLOB orderbook DOWN ({down_token_id[:12]}…) sin asks — "
-                                f"respuesta vacía: {book}"
+                                f"CLOB orderbook DOWN ({down_token_id[:12]}…) sin asks ni bids — "
+                                f"respuesta: {book}"
                             )
                     else:
                         body = await resp.text()
@@ -664,11 +720,22 @@ class PolymarketClient:
             Tupla (up_price, down_price) o None si no se pueden extraer
         """
         try:
-            # Campo outcomePrices: lista de strings ["0.55", "0.45"]
-            outcome_prices = market_data.get("outcomePrices")
+            # Campo outcomePrices: puede ser JSON string '["0.55","0.45"]' o lista directa
+            outcome_prices_raw = market_data.get("outcomePrices")
+            outcome_prices = None
+            if outcome_prices_raw is not None:
+                if isinstance(outcome_prices_raw, str):
+                    try:
+                        outcome_prices = json.loads(outcome_prices_raw)
+                    except json.JSONDecodeError:
+                        logger.debug(f"outcomePrices no es JSON válido: {outcome_prices_raw!r}")
+                else:
+                    outcome_prices = outcome_prices_raw
+
             if outcome_prices and len(outcome_prices) >= 2:
                 up = float(outcome_prices[0])
                 down = float(outcome_prices[1])
+                logger.debug(f"outcomePrices extraídos del Gamma API — UP: {up:.4f} | DOWN: {down:.4f}")
                 if 0.0 < up < 1.0 and 0.0 < down < 1.0:
                     return up, down
 
@@ -830,6 +897,11 @@ class PolymarketClient:
         try:
             from py_clob_client.clob_types import OrderArgs, OrderType
 
+            logger.info(
+                f"[ORDER SIGN] Construyendo L2 signed order — "
+                f"token_id={token_id[:16]}… | price={price:.4f} | size={size:.4f} | side=BUY"
+            )
+
             order_args = OrderArgs(
                 token_id=token_id,
                 price=price,
@@ -837,13 +909,39 @@ class PolymarketClient:
                 side="BUY",
             )
 
-            # Crear y firmar la orden límite GTC
+            logger.debug(
+                f"[ORDER SIGN] OrderArgs — "
+                f"token_id={token_id} | price={price} | size={size} | side=BUY"
+            )
+
+            # Crear y firmar la orden límite GTC (L2 signed order)
+            logger.info("[ORDER SIGN] Llamando create_order() para firmar la orden…")
             signed_order = self._clob_client.create_order(order_args)
+
+            # Log signing details for debugging
+            try:
+                sig = getattr(signed_order, "signature", None) or getattr(
+                    signed_order, "sig", None
+                )
+                maker = getattr(signed_order, "maker", None)
+                salt = getattr(signed_order, "salt", None)
+                logger.info(
+                    f"[ORDER SIGN] Orden firmada con éxito — "
+                    f"maker={maker} | "
+                    f"salt={salt} | "
+                    f"signature={str(sig)[:20]}… (len={len(str(sig)) if sig else 0})"
+                )
+                logger.debug(f"[ORDER SIGN] Objeto signed_order completo: {signed_order}")
+            except Exception as log_err:
+                logger.debug(f"[ORDER SIGN] No se pudieron extraer detalles de firma: {log_err}")
+
+            logger.info(f"[ORDER SIGN] Enviando orden al CLOB (OrderType.GTC)…")
             response = self._clob_client.post_order(signed_order, OrderType.GTC)
+            logger.info(f"[ORDER SIGN] Respuesta del CLOB: {response}")
             return response
 
         except Exception as e:
-            logger.error(f"Error en _place_order_sync: {e}")
+            logger.error(f"Error en _place_order_sync: {e}", exc_info=True)
             return {"success": False, "errorMsg": str(e)}
 
     def get_current_window_slug(self) -> str:

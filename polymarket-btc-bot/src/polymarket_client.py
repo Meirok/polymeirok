@@ -6,7 +6,6 @@ Soporta modo simulación (DRY_RUN) y modo producción con py-clob-client.
 import asyncio
 import datetime
 import json
-import re
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -143,8 +142,8 @@ class PolymarketClient:
 
     @staticmethod
     def _is_valid_token_id(token_id: str) -> bool:
-        """Returns True if token_id is a 64-character lowercase hex string."""
-        return bool(token_id and re.fullmatch(r"[0-9a-fA-F]{64}", token_id))
+        """Returns True if token_id is a non-empty decimal integer string longer than 10 chars."""
+        return bool(token_id and token_id.strip().isdigit() and len(token_id) > 10)
 
     async def _fetch_gamma_markets(
         self, session: aiohttp.ClientSession, params: dict, label: str
@@ -509,7 +508,7 @@ class PolymarketClient:
                 if not self._is_valid_token_id(tid):
                     logger.error(
                         f"Token ID inválido para {label}: '{tid}' "
-                        f"(se esperaba hex de 64 chars). "
+                        f"(se esperaba entero decimal de más de 10 dígitos). "
                         f"Respuesta completa del mercado:\n"
                         f"{json.dumps(market, indent=2, default=str)}"
                     )

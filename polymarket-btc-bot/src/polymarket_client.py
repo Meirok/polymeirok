@@ -502,13 +502,13 @@ class PolymarketClient:
             Respuesta del cliente CLOB
         """
         try:
-            from py_clob_client.clob_types import OrderArgs, OrderType, Side
+            from py_clob_client.clob_types import OrderArgs, OrderType
 
             order_args = OrderArgs(
                 token_id=token_id,
                 price=price,
                 size=size,
-                side=Side.BUY,
+                side="BUY",
             )
 
             # Crear y firmar la orden límite GTC

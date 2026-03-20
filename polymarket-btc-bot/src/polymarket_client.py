@@ -502,16 +502,18 @@ class PolymarketClient:
             Respuesta del cliente CLOB
         """
         try:
-            from py_clob_client.clob_types import MarketOrderArgs, OrderType
+            from py_clob_client.clob_types import OrderArgs, OrderType, Side
 
-            order_args = MarketOrderArgs(
+            order_args = OrderArgs(
                 token_id=token_id,
-                amount=size,
+                price=price,
+                size=size,
+                side=Side.BUY,
             )
 
-            # Crear y firmar la orden de mercado
-            signed_order = self._clob_client.create_market_order(order_args)
-            response = self._clob_client.post_order(signed_order, OrderType.FOK)
+            # Crear y firmar la orden límite GTC
+            signed_order = self._clob_client.create_order(order_args)
+            response = self._clob_client.post_order(signed_order, OrderType.GTC)
             return response
 
         except Exception as e:

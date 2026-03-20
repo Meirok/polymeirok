@@ -183,38 +183,64 @@ class PolymarketClient:
 
     def _extract_tokens_from_market(self, market: dict) -> tuple[str, str]:
         """
-        Parses the tokens array from a Gamma API market object.
+        Parses token IDs from a Gamma API market object.
 
-        Expected structure:
-            market["tokens"] = [
-                {"token_id": "abc...", "outcome": "Up"},
-                {"token_id": "def...", "outcome": "Down"},
-            ]
+        Primary: clobTokenIds is a JSON string array, matched by index with
+        the outcomes JSON string array (e.g. '["Up","Down"]' or '["Yes","No"]').
+
+        Fallback: tokens array with outcome/token_id keys.
 
         Returns (up_token_id, down_token_id) — empty strings if not found.
         """
         up_token_id = ""
         down_token_id = ""
 
-        tokens = market.get("tokens", [])
-        if tokens:
-            for token in tokens:
-                outcome = str(token.get("outcome", "")).lower()
-                tid = str(token.get("token_id", ""))
-                if "up" in outcome:
-                    up_token_id = tid
-                elif "down" in outcome:
-                    down_token_id = tid
-
-        # Fallback: clobTokenIds in positional order (UP=0, DOWN=1)
-        if not up_token_id or not down_token_id:
-            clob_ids = market.get("clobTokenIds", [])
-            if len(clob_ids) >= 2:
-                logger.debug(
-                    "tokens array missing/incomplete — falling back to clobTokenIds positional order"
+        # Primary: clobTokenIds (JSON string) + outcomes (JSON string)
+        clob_token_ids_raw = market.get("clobTokenIds")
+        if clob_token_ids_raw:
+            try:
+                token_ids = (
+                    json.loads(clob_token_ids_raw)
+                    if isinstance(clob_token_ids_raw, str)
+                    else clob_token_ids_raw
                 )
-                up_token_id = up_token_id or str(clob_ids[0])
-                down_token_id = down_token_id or str(clob_ids[1])
+                outcomes_raw = market.get("outcomes", '["Up", "Down"]')
+                outcomes = (
+                    json.loads(outcomes_raw)
+                    if isinstance(outcomes_raw, str)
+                    else outcomes_raw
+                )
+
+                logger.debug(f"clobTokenIds parsed: {token_ids}")
+                logger.debug(f"outcomes parsed: {outcomes}")
+
+                for i, outcome in enumerate(outcomes):
+                    if i >= len(token_ids):
+                        break
+                    outcome_lower = str(outcome).lower()
+                    if "up" in outcome_lower or "yes" in outcome_lower:
+                        up_token_id = str(token_ids[i])
+                    elif "down" in outcome_lower or "no" in outcome_lower:
+                        down_token_id = str(token_ids[i])
+
+                logger.debug(
+                    f"Tokens matched from clobTokenIds — UP: '{up_token_id}' | DOWN: '{down_token_id}'"
+                )
+            except (json.JSONDecodeError, IndexError, TypeError) as e:
+                logger.warning(f"Error parsing clobTokenIds/outcomes: {e}")
+
+        # Fallback: tokens array with outcome/token_id keys
+        if not up_token_id or not down_token_id:
+            tokens = market.get("tokens", [])
+            if tokens:
+                logger.debug("Falling back to tokens array for token ID extraction")
+                for token in tokens:
+                    outcome = str(token.get("outcome", "")).lower()
+                    tid = str(token.get("token_id", ""))
+                    if "up" in outcome or "yes" in outcome:
+                        up_token_id = up_token_id or tid
+                    elif "down" in outcome or "no" in outcome:
+                        down_token_id = down_token_id or tid
 
         return up_token_id, down_token_id
 
@@ -257,6 +283,81 @@ class PolymarketClient:
 
         return None
 
+    async def _find_active_btc_5m_market(
+        self, session: aiohttp.ClientSession
+    ) -> Optional[dict]:
+        """
+        Search for an active BTC 5-minute market using the broad active listing.
+
+        Fetches GET /markets?active=true&closed=false&limit=50 and filters where:
+        - question contains "BTC" or "Bitcoin" (case-insensitive)
+        - question contains "5", "5m", or "minute" (case-insensitive)
+        - closed is false
+        - endDateIso is today or tomorrow
+
+        Returns the raw market dict or None if not found.
+        """
+        markets = await self._fetch_gamma_markets(
+            session,
+            {"active": "true", "closed": "false", "limit": "50"},
+            label="active+closed=false",
+        )
+        if not markets:
+            return None
+
+        today = datetime.date.today()
+        tomorrow = today + datetime.timedelta(days=1)
+
+        for m in markets:
+            if m.get("closed", True):
+                continue
+
+            question = m.get("question", "")
+            question_lower = question.lower()
+
+            btc_match = "btc" in question_lower or "bitcoin" in question_lower
+            five_match = any(
+                tok in question_lower
+                for tok in ("5m", " 5 ", "five", "5-min", "5 min", "5minute", "5 minute")
+            )
+
+            if not (btc_match and five_match):
+                continue
+
+            # Check endDateIso (or endDate) is today or tomorrow
+            end_date_iso = m.get("endDateIso", m.get("endDate", ""))
+            if end_date_iso:
+                try:
+                    end_date = datetime.date.fromisoformat(end_date_iso[:10])
+                    if end_date not in (today, tomorrow):
+                        continue
+                except ValueError:
+                    pass  # If we can't parse the date, still try this market
+
+            # Parse outcomes and token IDs for debug logging
+            clob_raw = m.get("clobTokenIds", "")
+            outcomes_raw = m.get("outcomes", "")
+            try:
+                parsed_token_ids = json.loads(clob_raw) if isinstance(clob_raw, str) and clob_raw else clob_raw
+            except json.JSONDecodeError:
+                parsed_token_ids = clob_raw
+            try:
+                parsed_outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) and outcomes_raw else outcomes_raw
+            except json.JSONDecodeError:
+                parsed_outcomes = outcomes_raw
+
+            logger.info(
+                f"[Market Discovery] Found BTC 5m market:\n"
+                f"  question:    {question}\n"
+                f"  id:          {m.get('id')}\n"
+                f"  endDateIso:  {end_date_iso}\n"
+                f"  outcomes:    {parsed_outcomes}\n"
+                f"  token IDs:   {parsed_token_ids}"
+            )
+            return m
+
+        return None
+
     async def get_market(self, slug: Optional[str] = None) -> Optional[MarketInfo]:
         """
         Obtiene información del mercado activo por su slug.
@@ -264,8 +365,10 @@ class PolymarketClient:
         Discovery order:
           1. Log raw crypto-tag listing (debug only).
           2. Try multiple slug formats for the current window.
-          3. If none match, search by tag=btc and filter by question + end_date.
-          4. Cache the result for the current window to avoid redundant API calls.
+          3a. Active listing fallback: GET /markets?active=true&closed=false&limit=50,
+              filter by BTC/Bitcoin + 5m keyword + endDateIso today or tomorrow.
+          3b. Tag-based fallback: tag=btc + question/end_date filter.
+          4. Cache the result for the current 5-minute window.
 
         Args:
             slug: Slug del mercado (usa el de la ventana actual si es None)
@@ -324,10 +427,23 @@ class PolymarketClient:
                 logger.info(f"Mercado encontrado con slug={candidate}")
                 break
 
-        # --- Step 3: Tag-based fallback ---
+        # --- Step 3a: Active listing fallback (primary fallback) ---
         if raw_market is None:
             logger.info(
                 f"Ningún slug coincidió para ventana {window_ts} — "
+                "buscando mercado activo BTC 5m (active=true&closed=false&limit=50)…"
+            )
+            raw_market = await self._find_active_btc_5m_market(session)
+            if raw_market:
+                matched_slug = raw_market.get("slug", "")
+                logger.info(
+                    f"Mercado encontrado por búsqueda activa — slug={matched_slug}"
+                )
+
+        # --- Step 3b: Tag-based fallback (secondary fallback) ---
+        if raw_market is None:
+            logger.info(
+                "Búsqueda activa sin resultados — "
                 "buscando por tag=btc con filtro de pregunta y fecha…"
             )
             raw_market = await self._find_market_by_tag(session, window_close_ts)
@@ -364,11 +480,28 @@ class PolymarketClient:
                 f"slug={market.get('slug')} active={market.get('active')}"
             )
 
-            # Extract UP/DOWN token IDs from tokens array
+            # Extract UP/DOWN token IDs (from clobTokenIds JSON string, or tokens array)
             up_token_id, down_token_id = self._extract_tokens_from_market(market)
 
+            # Detailed debug: show full question, parsed outcomes, and matched token IDs
+            clob_raw = market.get("clobTokenIds", "")
+            outcomes_raw = market.get("outcomes", "")
+            try:
+                dbg_tokens = json.loads(clob_raw) if isinstance(clob_raw, str) and clob_raw else clob_raw
+            except json.JSONDecodeError:
+                dbg_tokens = clob_raw
+            try:
+                dbg_outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) and outcomes_raw else outcomes_raw
+            except json.JSONDecodeError:
+                dbg_outcomes = outcomes_raw
+
             logger.debug(
-                f"Token IDs extraídos — UP: '{up_token_id}' | DOWN: '{down_token_id}'"
+                f"Token extraction summary:\n"
+                f"  question:  {market.get('question')}\n"
+                f"  outcomes:  {dbg_outcomes}\n"
+                f"  token IDs: {dbg_tokens}\n"
+                f"  UP token:  {up_token_id}\n"
+                f"  DOWN token:{down_token_id}"
             )
 
             # Validate token IDs — abort if either is malformed

@@ -110,22 +110,19 @@ class PolymarketClient:
 
         try:
             from py_clob_client.client import ClobClient
-            from py_clob_client.clob_types import ApiCreds
 
-            creds = ApiCreds(
-                api_key="",
-                api_secret="",
-                api_passphrase="",
-            )
+            clob_kwargs = {
+                "host": self.config.clob_api_base,
+                "chain_id": 137,  # Polygon Mainnet
+                "key": self.config.private_key,
+                "signature_type": self.config.signature_type,
+            }
 
-            self._clob_client = ClobClient(
-                host=self.config.clob_api_base,
-                chain_id=137,  # Polygon Mainnet
-                private_key=self.config.private_key,
-                creds=creds,
-                signature_type=self.config.signature_type,
-                funder=self.config.polymarket_proxy_address,
-            )
+            # Only pass funder if signature_type != 0 or proxy address is set
+            if self.config.signature_type != 0 or self.config.polymarket_proxy_address:
+                clob_kwargs["funder"] = self.config.polymarket_proxy_address
+
+            self._clob_client = ClobClient(**clob_kwargs)
 
             # Derivar credenciales desde la clave privada
             self._clob_client.set_api_creds(self._clob_client.create_or_derive_api_creds())

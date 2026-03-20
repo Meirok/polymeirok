@@ -4,6 +4,8 @@ Soporta modo simulación (DRY_RUN) y modo producción con py-clob-client.
 """
 
 import asyncio
+import json
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -136,9 +138,89 @@ class PolymarketClient:
             logger.error(f"Error inicializando cliente CLOB: {e}", exc_info=True)
             return False
 
+    @staticmethod
+    def _is_valid_token_id(token_id: str) -> bool:
+        """Returns True if token_id is a 64-character lowercase hex string."""
+        return bool(token_id and re.fullmatch(r"[0-9a-fA-F]{64}", token_id))
+
+    async def _fetch_gamma_markets(
+        self, session: aiohttp.ClientSession, params: dict, label: str
+    ) -> Optional[list]:
+        """
+        Fetches markets from Gamma API with the given query params.
+        Logs the full raw response at DEBUG level.
+        Returns the list of markets or None on failure.
+        """
+        url = f"{self.config.gamma_api_base}/markets"
+        logger.debug(f"Gamma API request [{label}]: GET {url} params={params}")
+        try:
+            async with session.get(url, params=params) as response:
+                raw_text = await response.text()
+                logger.debug(
+                    f"Gamma API raw response [{label}] HTTP {response.status}:\n{raw_text}"
+                )
+                if response.status != 200:
+                    logger.warning(
+                        f"Gamma API respondió {response.status} para {label}"
+                    )
+                    return None
+                try:
+                    data = json.loads(raw_text)
+                except json.JSONDecodeError as exc:
+                    logger.error(
+                        f"Gamma API respuesta no es JSON válido [{label}]: {exc}\n"
+                        f"Body: {raw_text[:500]}"
+                    )
+                    return None
+                markets = data if isinstance(data, list) else data.get("data", [])
+                return markets if markets else None
+        except aiohttp.ClientError as e:
+            logger.error(f"Error HTTP al consultar Gamma API [{label}]: {e}")
+            return None
+
+    def _extract_tokens_from_market(self, market: dict) -> tuple[str, str]:
+        """
+        Parses the tokens array from a Gamma API market object.
+
+        Expected structure:
+            market["tokens"] = [
+                {"token_id": "abc...", "outcome": "Up"},
+                {"token_id": "def...", "outcome": "Down"},
+            ]
+
+        Returns (up_token_id, down_token_id) — empty strings if not found.
+        """
+        up_token_id = ""
+        down_token_id = ""
+
+        tokens = market.get("tokens", [])
+        if tokens:
+            for token in tokens:
+                outcome = str(token.get("outcome", "")).lower()
+                tid = str(token.get("token_id", ""))
+                if "up" in outcome:
+                    up_token_id = tid
+                elif "down" in outcome:
+                    down_token_id = tid
+
+        # Fallback: clobTokenIds in positional order (UP=0, DOWN=1)
+        if not up_token_id or not down_token_id:
+            clob_ids = market.get("clobTokenIds", [])
+            if len(clob_ids) >= 2:
+                logger.debug(
+                    "tokens array missing/incomplete — falling back to clobTokenIds positional order"
+                )
+                up_token_id = up_token_id or str(clob_ids[0])
+                down_token_id = down_token_id or str(clob_ids[1])
+
+        return up_token_id, down_token_id
+
     async def get_market(self, slug: Optional[str] = None) -> Optional[MarketInfo]:
         """
         Obtiene información del mercado activo por su slug.
+
+        Uses the Gamma API with active=true filter. If the primary slug-based
+        lookup fails, retries with an alternative tag-based endpoint.
 
         Args:
             slug: Slug del mercado (usa el de la ventana actual si es None)
@@ -147,83 +229,88 @@ class PolymarketClient:
             MarketInfo si el mercado existe, None en caso contrario
         """
         market_slug = slug or _get_window_slug()
+        session = await self._get_session()
+
+        # --- Primary endpoint ---
+        markets = await self._fetch_gamma_markets(
+            session,
+            {"slug": market_slug, "active": "true"},
+            label=f"slug={market_slug}",
+        )
+
+        # --- Alternative endpoint if primary returns nothing ---
+        if not markets:
+            logger.info(
+                f"Mercado no encontrado con slug={market_slug}, "
+                "intentando endpoint alternativo tag=btc-5m"
+            )
+            markets = await self._fetch_gamma_markets(
+                session,
+                {"tag": "btc-5m", "active": "true", "limit": "1"},
+                label="tag=btc-5m",
+            )
+
+        if not markets:
+            logger.debug(f"No se encontró mercado activo para slug: {market_slug}")
+            return None
 
         try:
-            session = await self._get_session()
-            url = f"{self.config.gamma_api_base}/markets"
-            params = {"slug": market_slug}
+            market = markets[0]
+            logger.debug(
+                f"Mercado seleccionado: id={market.get('id')} "
+                f"slug={market.get('slug')} active={market.get('active')}"
+            )
 
-            logger.debug(f"Buscando mercado: {market_slug}")
+            # Extract UP/DOWN token IDs from tokens array
+            up_token_id, down_token_id = self._extract_tokens_from_market(market)
 
-            async with session.get(url, params=params) as response:
-                if response.status != 200:
-                    logger.warning(
-                        f"API Gamma respondió {response.status} para slug={market_slug}"
+            logger.debug(
+                f"Token IDs extraídos — UP: '{up_token_id}' | DOWN: '{down_token_id}'"
+            )
+
+            # Validate token IDs — abort if either is malformed
+            for tid, label in ((up_token_id, "UP"), (down_token_id, "DOWN")):
+                if not self._is_valid_token_id(tid):
+                    logger.error(
+                        f"Token ID inválido para {label}: '{tid}' "
+                        f"(se esperaba hex de 64 chars). "
+                        f"Respuesta completa del mercado:\n"
+                        f"{json.dumps(market, indent=2, default=str)}"
                     )
                     return None
 
-                data = await response.json()
+            up_price = 0.5
+            down_price = 0.5
+            orderbook_price_available = False
 
-                # La API retorna una lista de mercados
-                markets = data if isinstance(data, list) else data.get("data", [])
+            prices = await self._get_token_prices(
+                up_token_id, down_token_id, gamma_market_data=market
+            )
+            if prices is not None:
+                up_price, down_price, orderbook_price_available = prices
 
-                if not markets:
-                    logger.debug(f"No se encontró mercado para slug: {market_slug}")
-                    return None
-
-                market = markets[0]
-
-                # Extraer tokens (outcomes) del mercado
-                tokens = market.get("tokens", []) or market.get("clobTokenIds", [])
-
-                # Intentar identificar UP y DOWN tokens
-                up_token_id = ""
-                down_token_id = ""
-                up_price = 0.5
-                down_price = 0.5
-
-                outcomes = market.get("outcomes", ["UP", "DOWN"])
-                clob_token_ids = market.get("clobTokenIds", [])
-
-                if len(clob_token_ids) >= 2:
-                    # Asumir que el orden es UP=0, DOWN=1
-                    up_token_id = str(clob_token_ids[0])
-                    down_token_id = str(clob_token_ids[1])
-
-                # Intentar obtener precios actuales del orderbook (con fallback Gamma)
-                orderbook_price_available = False
-                if up_token_id:
-                    prices = await self._get_token_prices(
-                        up_token_id, down_token_id, gamma_market_data=market
-                    )
-                    if prices is not None:
-                        up_price, down_price, orderbook_price_available = prices
-
-                if not orderbook_price_available:
-                    logger.warning(
-                        "Precio de orderbook no disponible — omitiendo filtro de odds"
-                    )
-
-                return MarketInfo(
-                    market_id=str(market.get("id", "")),
-                    slug=market_slug,
-                    question=market.get("question", ""),
-                    condition_id=market.get("conditionId", ""),
-                    up_token_id=up_token_id,
-                    down_token_id=down_token_id,
-                    up_price=up_price,
-                    down_price=down_price,
-                    is_active=market.get("active", False),
-                    end_date_iso=market.get("endDate", ""),
-                    orderbook_price_available=orderbook_price_available,
-                    extra=market,
+            if not orderbook_price_available:
+                logger.warning(
+                    "Precio de orderbook no disponible — omitiendo filtro de odds"
                 )
 
-        except aiohttp.ClientError as e:
-            logger.error(f"Error HTTP al obtener mercado {market_slug}: {e}")
-            return None
+            return MarketInfo(
+                market_id=str(market.get("id", "")),
+                slug=market.get("slug", market_slug),
+                question=market.get("question", ""),
+                condition_id=market.get("conditionId", ""),
+                up_token_id=up_token_id,
+                down_token_id=down_token_id,
+                up_price=up_price,
+                down_price=down_price,
+                is_active=market.get("active", False),
+                end_date_iso=market.get("endDate", ""),
+                orderbook_price_available=orderbook_price_available,
+                extra=market,
+            )
+
         except Exception as e:
-            logger.error(f"Error inesperado al obtener mercado: {e}", exc_info=True)
+            logger.error(f"Error inesperado al procesar mercado: {e}", exc_info=True)
             return None
 
     async def _get_token_prices(

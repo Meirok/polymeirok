@@ -4,6 +4,7 @@ Soporta modo simulación (DRY_RUN) y modo producción con py-clob-client.
 """
 
 import asyncio
+import datetime
 import json
 import re
 import time
@@ -86,6 +87,8 @@ class PolymarketClient:
         self.config = config
         self._session: Optional[aiohttp.ClientSession] = None
         self._clob_client = None  # Cliente CLOB (inicializado lazy en producción)
+        # Cache: window_ts -> MarketInfo (or None if not found), cleared on new window
+        self._market_cache: dict[int, Optional["MarketInfo"]] = {}
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """Obtiene o crea la sesión HTTP."""
@@ -215,12 +218,54 @@ class PolymarketClient:
 
         return up_token_id, down_token_id
 
+    async def _find_market_by_tag(
+        self, session: aiohttp.ClientSession, window_close_ts: int
+    ) -> Optional[dict]:
+        """
+        Search for a BTC 5-minute market using tag=btc and filter by question text
+        and end_date proximity to window_close_ts (±120 s).
+
+        Returns the raw market dict or None if not found.
+        """
+        markets = await self._fetch_gamma_markets(
+            session,
+            {"tag": "btc", "active": "true", "limit": "10"},
+            label="tag=btc",
+        )
+        if not markets:
+            return None
+
+        tolerance = 120  # seconds
+        for m in markets:
+            question = m.get("question", "").lower()
+            btc_match = "btc" in question or "bitcoin" in question
+            five_match = any(tok in question for tok in ("5m", " 5 ", "five", "5-min", "5 min"))
+            if not (btc_match and five_match):
+                continue
+
+            end_date = m.get("endDate", "")
+            if end_date:
+                try:
+                    end_dt = datetime.datetime.fromisoformat(
+                        end_date.replace("Z", "+00:00")
+                    )
+                    end_ts = int(end_dt.timestamp())
+                    if abs(end_ts - window_close_ts) <= tolerance:
+                        return m
+                except (ValueError, AttributeError):
+                    pass
+
+        return None
+
     async def get_market(self, slug: Optional[str] = None) -> Optional[MarketInfo]:
         """
         Obtiene información del mercado activo por su slug.
 
-        Uses the Gamma API with active=true filter. If the primary slug-based
-        lookup fails, retries with an alternative tag-based endpoint.
+        Discovery order:
+          1. Log raw crypto-tag listing (debug only).
+          2. Try multiple slug formats for the current window.
+          3. If none match, search by tag=btc and filter by question + end_date.
+          4. Cache the result for the current window to avoid redundant API calls.
 
         Args:
             slug: Slug del mercado (usa el de la ventana actual si es None)
@@ -228,34 +273,92 @@ class PolymarketClient:
         Returns:
             MarketInfo si el mercado existe, None en caso contrario
         """
-        market_slug = slug or _get_window_slug()
+        ts = int(time.time())
+        window_ts = ts - (ts % 300)
+        window_close_ts = window_ts + 300
+
+        # --- Cache check ---
+        if window_ts in self._market_cache:
+            logger.debug(f"Retornando mercado en caché para ventana {window_ts}")
+            return self._market_cache[window_ts]
+
+        # Evict stale cache entries (keep only current window)
+        stale_keys = [k for k in self._market_cache if k != window_ts]
+        for k in stale_keys:
+            del self._market_cache[k]
+
         session = await self._get_session()
 
-        # --- Primary endpoint ---
-        markets = await self._fetch_gamma_markets(
+        # --- Step 1: Log raw crypto listing for visibility ---
+        logger.debug("Solicitando listado raw de Gamma API (tag=crypto) para diagnóstico…")
+        await self._fetch_gamma_markets(
             session,
-            {"slug": market_slug, "active": "true"},
-            label=f"slug={market_slug}",
+            {"tag": "crypto", "active": "true", "limit": "50"},
+            label="debug:tag=crypto",
         )
 
-        # --- Alternative endpoint if primary returns nothing ---
-        if not markets:
-            logger.info(
-                f"Mercado no encontrado con slug={market_slug}, "
-                "intentando endpoint alternativo tag=btc-5m"
-            )
+        # --- Step 2: Try multiple slug formats ---
+        slug_candidates: list[str] = []
+        if slug:
+            slug_candidates.append(slug)
+        slug_candidates += [
+            f"btc-updown-5m-{window_ts}",
+            f"btc-up-or-down-5m-{window_ts}",
+            f"bitcoin-up-or-down-5m-{window_ts}",
+        ]
+        # Deduplicate while preserving order
+        seen: set[str] = set()
+        slugs_to_try = [s for s in slug_candidates if not (s in seen or seen.add(s))]  # type: ignore[func-returns-value]
+
+        raw_market: Optional[dict] = None
+        matched_slug = ""
+        for candidate in slugs_to_try:
             markets = await self._fetch_gamma_markets(
                 session,
-                {"tag": "btc-5m", "active": "true", "limit": "1"},
-                label="tag=btc-5m",
+                {"slug": candidate, "active": "true"},
+                label=f"slug={candidate}",
             )
+            if markets:
+                raw_market = markets[0]
+                matched_slug = candidate
+                logger.info(f"Mercado encontrado con slug={candidate}")
+                break
 
-        if not markets:
-            logger.debug(f"No se encontró mercado activo para slug: {market_slug}")
+        # --- Step 3: Tag-based fallback ---
+        if raw_market is None:
+            logger.info(
+                f"Ningún slug coincidió para ventana {window_ts} — "
+                "buscando por tag=btc con filtro de pregunta y fecha…"
+            )
+            raw_market = await self._find_market_by_tag(session, window_close_ts)
+            if raw_market:
+                matched_slug = raw_market.get("slug", "")
+                logger.info(
+                    f"Mercado encontrado por tag=btc — slug={matched_slug}"
+                )
+
+        if raw_market is None:
+            logger.warning(
+                f"Mercado no encontrado para ventana {window_ts} "
+                f"(slugs probados: {slugs_to_try})"
+            )
+            self._market_cache[window_ts] = None
             return None
 
+        # --- Step 4: Log full market data ---
+        logger.info(
+            f"Mercado confirmado — slug={raw_market.get('slug')} | "
+            f"question={raw_market.get('question')} | "
+            f"id={raw_market.get('id')} | "
+            f"endDate={raw_market.get('endDate')}"
+        )
+        logger.debug(
+            f"Datos completos del mercado:\n"
+            f"{json.dumps(raw_market, indent=2, default=str)}"
+        )
+
         try:
-            market = markets[0]
+            market = raw_market
             logger.debug(
                 f"Mercado seleccionado: id={market.get('id')} "
                 f"slug={market.get('slug')} active={market.get('active')}"
@@ -277,6 +380,7 @@ class PolymarketClient:
                         f"Respuesta completa del mercado:\n"
                         f"{json.dumps(market, indent=2, default=str)}"
                     )
+                    self._market_cache[window_ts] = None
                     return None
 
             up_price = 0.5
@@ -294,9 +398,10 @@ class PolymarketClient:
                     "Precio de orderbook no disponible — omitiendo filtro de odds"
                 )
 
-            return MarketInfo(
+            # --- Step 5: Build and cache result ---
+            result = MarketInfo(
                 market_id=str(market.get("id", "")),
-                slug=market.get("slug", market_slug),
+                slug=market.get("slug", matched_slug),
                 question=market.get("question", ""),
                 condition_id=market.get("conditionId", ""),
                 up_token_id=up_token_id,
@@ -308,6 +413,8 @@ class PolymarketClient:
                 orderbook_price_available=orderbook_price_available,
                 extra=market,
             )
+            self._market_cache[window_ts] = result
+            return result
 
         except Exception as e:
             logger.error(f"Error inesperado al procesar mercado: {e}", exc_info=True)
